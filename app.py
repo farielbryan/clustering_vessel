@@ -14,26 +14,33 @@ st.title("📍 Analyse de Clusters Géospatiaux (DBSCAN)")
 
 # --- Sidebar : Paramètres ---
 st.sidebar.header("Configuration")
-eps = st.sidebar.slider("Rayon (EPS) en degrés", 0.001, 0.100, 0.005, format="%.3f")
+
+# --- MODIFICATION ICI : Entrée en KM et conversion en Degrés ---
+# On propose un rayon entre 0.1 km (100m) et 10 km
+eps_km = st.sidebar.slider("Rayon (EPS) en km", 0.1, 0.3, 0.1, step=0.1)
+# Conversion pour l'algorithme (1 degré latitude ~= 111.32 km)
+eps = eps_km / 111.32 
+
 min_samples = st.sidebar.number_input("Min points par cluster", min_value=1, value=20)
 sample_limit = st.sidebar.slider("Limite d'échantillonnage", 1000, 100000, 45000)
 
-# --- Fonctions avec MISE EN CACHE (C'est ça qui empêche les bugs) ---
+# --- Fonctions avec MISE EN CACHE (Optimisées) ---
 
 @st.cache_data
 def load_data(file_path_or_buffer, file_type):
-    """Charge les données et les met en cache pour ne pas recharger à chaque clic."""
+    """Charge les données et les met en cache."""
     try:
         if file_type == 'csv':
-            # Si c'est un buffer (upload), on doit remettre le curseur au début
+            # Si c'est un fichier uploadé (buffer), on remet le curseur au début
             if hasattr(file_path_or_buffer, 'seek'):
                 file_path_or_buffer.seek(0)
+                # Lecture rapide pour détecter le séparateur
                 content = file_path_or_buffer.getvalue().decode("utf-8").splitlines()
                 sep = ',' if content[0].count(',') >= content[0].count(';') else ';'
                 file_path_or_buffer.seek(0)
                 return pd.read_csv(file_path_or_buffer, sep=sep)
             else:
-                # Lecture fichier local
+                # Lecture fichier local (string path)
                 with open(file_path_or_buffer, 'r', encoding='utf-8') as f:
                     first_line = f.readline()
                     sep = ',' if first_line.count(',') >= first_line.count(';') else ';'
@@ -45,7 +52,7 @@ def load_data(file_path_or_buffer, file_type):
 
 @st.cache_data
 def detect_lon_lat(columns):
-    """Détecte les noms des colonnes une seule fois."""
+    """Détecte les noms des colonnes (nécessite une liste en entrée)."""
     cols_lower = {c.lower(): c for c in columns}
     lon_keys = ["longitude", "lon", "long", "lng", "x"]
     lat_keys = ["latitude", "lat", "y"]
@@ -61,8 +68,9 @@ def process_coords(df, lon_col, lat_col, limit):
     
     coords = df[[lon_col, lat_col]].copy()
     coords.columns = ["lon", "lat"]
+    
+    # Conversion robuste en numérique
     for col in ["lon", "lat"]:
-        # Conversion robuste string -> float
         if coords[col].dtype == object:
             coords[col] = pd.to_numeric(coords[col].astype(str).str.replace(',', '.'), errors="coerce")
             
@@ -72,17 +80,17 @@ def process_coords(df, lon_col, lat_col, limit):
 
 @st.cache_data
 def run_dbscan(coords, eps, min_samples):
-    """C'est le calcul lourd. Le cache évite de le refaire si on ne touche pas aux sliders."""
+    """Exécute DBSCAN. Le cache évite de recalculer si les sliders ne bougent pas."""
     if len(coords) == 0: return coords, {}, 0, 0
     
-    # Clustering
+    # Algorithme DBSCAN
+    # Note: eps est ici reçu en degrés (après conversion)
     db = DBSCAN(eps=eps, min_samples=min_samples).fit(coords[["lon", "lat"]].values)
     
-    # Préparation résultats
     coords_result = coords.copy()
     coords_result["cluster"] = db.labels_
     
-    # Calcul polygones
+    # Calcul des polygones (Convex Hulls)
     polygons = {}
     unique_labels = set(db.labels_)
     if -1 in unique_labels: unique_labels.remove(-1)
@@ -101,6 +109,7 @@ def run_dbscan(coords, eps, min_samples):
 # --- Logique Principale ---
 
 DATA_DIR = "data"
+# Liste des fichiers disponibles localement
 available_ports = [f for f in os.listdir(DATA_DIR) if f.endswith(".csv")] if os.path.exists(DATA_DIR) else []
 
 st.sidebar.header("Source des données")
@@ -109,7 +118,7 @@ source_mode = st.sidebar.radio("Choisir la source :", ["Fichier pré-chargé", "
 df = None
 file_name = "resultats"
 
-# Chargement des données (optimisé)
+# 1. Chargement des données
 if source_mode == "Fichier pré-chargé":
     if available_ports:
         selected_file = st.sidebar.selectbox("Sélectionnez un port :", available_ports)
@@ -125,30 +134,31 @@ else:
         ftype = 'csv' if uploaded_file.name.endswith('.csv') else 'xlsx'
         df = load_data(uploaded_file, ftype)
 
-# --- Exécution ---
+# 2. Traitement et Affichage
 if df is not None:
-    lon_col, lat_col = detect_lon_lat(df.columns)
+    # --- CORRECTION : .tolist() pour le cache ---
+    lon_col, lat_col = detect_lon_lat(df.columns.tolist())
     
     if lon_col and lat_col:
-        # Nettoyage (Mis en cache)
+        # Nettoyage
         coords = process_coords(df, lon_col, lat_col, sample_limit)
         
-        # Clustering (Mis en cache -> Super rapide au rechargement)
+        # Clustering avec Spinner
         with st.spinner('Calcul des clusters en cours...'):
+            # On passe 'eps' qui est maintenant converti en degrés
             coords_result, polygons, n_clusters, n_noise = run_dbscan(coords, eps, min_samples)
 
-        # Affichage métriques
+        # Métriques
         col1, col2, col3 = st.columns(3)
         col1.metric("Points total", len(coords_result))
         col2.metric("Clusters détectés", n_clusters)
         col3.metric("Bruit (Points isolés)", n_noise)
 
-        # --- Carte Folium ---
-        # On centre la carte
+        # Carte Folium
         center = [coords_result["lat"].mean(), coords_result["lon"].mean()]
         m = folium.Map(location=center, zoom_start=11, tiles="Cartodb Positron")
 
-        # Ajout des polygones (Zones)
+        # Polygones des clusters
         for cid, poly in polygons.items():
             if isinstance(poly, Polygon):
                 locations = [(y, x) for x, y in poly.exterior.coords]
@@ -161,7 +171,7 @@ if df is not None:
                     tooltip=f"Cluster {cid}"
                 ).add_to(m)
 
-        # Ajout des points (Échantillon léger pour l'affichage uniquement)
+        # Points (Échantillon léger pour ne pas surcharger le navigateur)
         viz_sample = coords_result.sample(min(len(coords_result), 1000))
         for _, row in viz_sample.iterrows():
             c = "#ff0000" if row['cluster'] == -1 else "#3388ff"
@@ -169,16 +179,15 @@ if df is not None:
                 [row['lat'], row['lon']], 
                 radius=1.5, 
                 color=c, 
-                fill=True
+                fill=True,
+                fill_opacity=0.8
             ).add_to(m)
 
-        # AFFICHE LA CARTE SANS RECHARGER L'APP QUAND ON CLIQUE DESSUS
+        # Affichage de la carte
         st_folium(m, width=None, height=500, returned_objects=[])
 
-        # --- Export CSV ---
-        # Préparation du CSV en mémoire
+        # Bouton Télécharger
         csv = coords_result.to_csv(index=False).encode('utf-8')
-        
         st.download_button(
             label="📥 Télécharger les résultats (CSV)",
             data=csv,
@@ -187,4 +196,4 @@ if df is not None:
         )
 
     else:
-        st.error(f"Colonnes non trouvées. Colonnes disponibles : {list(df.columns)}")
+        st.error(f"Colonnes de coordonnées non trouvées. Colonnes disponibles : {list(df.columns)}")
